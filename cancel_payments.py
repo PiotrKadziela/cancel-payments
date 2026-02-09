@@ -65,17 +65,24 @@ def load_configuration() -> dict:
     """Load configuration from environment variables."""
     load_dotenv()
     
+    try:
+        magento_port = int(os.getenv('MAGENTO_DB_PORT', 3306))
+        papaya_port = int(os.getenv('PAPAYA_DB_PORT', 3306))
+    except ValueError as e:
+        logger.error(f"Invalid port number in configuration: {e}")
+        raise ValueError(f"Database port must be a valid integer: {e}")
+    
     config = {
         'magento': {
             'host': os.getenv('MAGENTO_DB_HOST'),
-            'port': int(os.getenv('MAGENTO_DB_PORT', 3306)),
+            'port': magento_port,
             'database': os.getenv('MAGENTO_DB_NAME'),
             'user': os.getenv('MAGENTO_DB_USER'),
             'password': os.getenv('MAGENTO_DB_PASSWORD'),
         },
         'papaya': {
             'host': os.getenv('PAPAYA_DB_HOST'),
-            'port': int(os.getenv('PAPAYA_DB_PORT', 3306)),
+            'port': papaya_port,
             'database': os.getenv('PAPAYA_DB_NAME'),
             'user': os.getenv('PAPAYA_DB_USER'),
             'password': os.getenv('PAPAYA_DB_PASSWORD'),
@@ -227,7 +234,7 @@ def cancel_payment_via_api(config: dict, payment_id: int) -> Tuple[bool, str]:
             try:
                 error_detail = response.json()
                 error_msg += f": {error_detail}"
-            except:
+            except (ValueError, requests.exceptions.JSONDecodeError):
                 error_msg += f": {response.text}"
             
             logger.error(f"Failed to cancel payment {payment_id}: {error_msg}")
