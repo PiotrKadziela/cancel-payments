@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 import mysql.connector
 import requests
@@ -304,7 +304,7 @@ def fetch_canceled_orders_from_magento() -> List[str]:
         raise
 
 
-def get_payments_for_order(order_increment_id: str) -> List[Dict[str, any]]:
+def get_payments_for_order(order_increment_id: str) -> List[Dict[str, Any]]:
     """
     Get payments for an order from Papaya database.
     
