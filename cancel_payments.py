@@ -151,9 +151,7 @@ def load_orders_from_csv(csv_filename: str) -> Dict[str, dict]:
             for row in reader:
                 order_id = row['order_id']
                 # Convert string booleans to actual booleans
-                row['requires_cancellation'] = row['requires_cancellation'] if row['requires_cancellation'] in ['True', 'False'] else None
-                if row['requires_cancellation'] is not None:
-                    row['requires_cancellation'] = row['requires_cancellation'] == 'True'
+                row['requires_cancellation'] = None if row['requires_cancellation'] == '' else row['requires_cancellation'] == 'True'
                 row['cancellation_attempted'] = row['cancellation_attempted'] == 'True'
                 orders_data[order_id] = row
         
@@ -223,7 +221,7 @@ def get_pending_orders_from_csv(csv_filename: str) -> List[str]:
     pending_orders = [
         order_id for order_id, order in orders_data.items()
         if not order.get('cancellation_attempted', False) 
-        and order.get('requires_cancellation', False) is True
+        and order.get('requires_cancellation', False)
     ]
     
     logger.info(f"Found {len(pending_orders)} pending orders to process from CSV")
@@ -275,7 +273,7 @@ def get_canceled_orders_from_magento(config: dict, csv_filename: Optional[str] =
                     for order_id in increment_ids:
                         orders_data[order_id] = {
                             'order_id': order_id,
-                            'payment_id': None,
+                            'payment_id': '',
                             'requires_cancellation': None,
                             'cancellation_attempted': False,
                             'cancellation_status': 'PENDING',
