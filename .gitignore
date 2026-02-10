@@ -42,6 +42,9 @@ env/
 # Logs
 *.log
 
+# CSV status files
+payment_cancellation_status_*.csv
+
 # OS
 .DS_Store
 Thumbs.db
