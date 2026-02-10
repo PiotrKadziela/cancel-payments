@@ -7,7 +7,8 @@ Automatically cancels payments in Papaya system for orders canceled in Magento.
 import os
 import sys
 import logging
-from typing import List, Tuple
+import csv
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
 import pymysql
@@ -126,11 +127,113 @@ def load_configuration() -> dict:
     return config
 
 
-def get_canceled_orders_from_magento(config: dict) -> List[str]:
+def get_csv_filename(config: dict) -> str:
+    """Generate CSV filename based on date range from configuration."""
+    date_from = config['date_from'].replace('-', '')
+    date_to = config['date_to'].replace('-', '')
+    return f"payment_cancellation_status_{date_from}_to_{date_to}.csv"
+
+
+def load_orders_from_csv(csv_filename: str) -> Dict[str, dict]:
+    """
+    Load existing orders from CSV file.
+    
+    Returns dictionary with order_id as key and order data as value.
+    """
+    if not os.path.exists(csv_filename):
+        logger.info(f"CSV file {csv_filename} does not exist")
+        return {}
+    
+    orders_data = {}
+    try:
+        with open(csv_filename, 'r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                order_id = row['order_id']
+                # Convert string booleans to actual booleans
+                row['requires_cancellation'] = None if row['requires_cancellation'] == '' else row['requires_cancellation'] == 'True'
+                row['cancellation_attempted'] = row['cancellation_attempted'] == 'True'
+                orders_data[order_id] = row
+        
+        logger.info(f"Loaded {len(orders_data)} orders from CSV: {csv_filename}")
+        return orders_data
+    except Exception as e:
+        logger.error(f"Error loading orders from CSV {csv_filename}: {e}")
+        raise
+
+
+def save_orders_to_csv(csv_filename: str, orders_data: Dict[str, dict]) -> None:
+    """Save all orders to CSV file."""
+    try:
+        fieldnames = ['order_id', 'payment_id', 'requires_cancellation', 
+                     'cancellation_attempted', 'cancellation_status', 
+                     'error_message', 'timestamp']
+        
+        with open(csv_filename, 'w', encoding='utf-8', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            writer.writeheader()
+            
+            for order_id in sorted(orders_data.keys()):
+                order = orders_data[order_id]
+                writer.writerow({
+                    'order_id': order.get('order_id', order_id),
+                    'payment_id': order.get('payment_id', ''),
+                    'requires_cancellation': order.get('requires_cancellation', None),
+                    'cancellation_attempted': order.get('cancellation_attempted', False),
+                    'cancellation_status': order.get('cancellation_status', 'PENDING'),
+                    'error_message': order.get('error_message', ''),
+                    'timestamp': order.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                })
+        
+        logger.info(f"Saved {len(orders_data)} orders to CSV: {csv_filename}")
+    except Exception as e:
+        logger.error(f"Error saving orders to CSV {csv_filename}: {e}")
+        raise
+
+
+def update_order_in_csv(csv_filename: str, order_id: str, updates: dict) -> None:
+    """
+    Update a single order in CSV file.
+    
+    Loads entire CSV, updates the order, and saves back to file.
+    """
+    orders_data = load_orders_from_csv(csv_filename)
+    
+    if order_id not in orders_data:
+        logger.warning(f"Order {order_id} not found in CSV")
+        return
+    
+    # Update the order with new values
+    orders_data[order_id].update(updates)
+    orders_data[order_id]['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    save_orders_to_csv(csv_filename, orders_data)
+
+
+def get_pending_orders_from_csv(csv_filename: str) -> List[str]:
+    """
+    Get list of order_ids that require processing.
+    
+    Returns orders where cancellation_attempted=False AND requires_cancellation=True.
+    """
+    orders_data = load_orders_from_csv(csv_filename)
+    
+    pending_orders = [
+        order_id for order_id, order in orders_data.items()
+        if not order.get('cancellation_attempted', False) 
+        and order.get('requires_cancellation', False)
+    ]
+    
+    logger.info(f"Found {len(pending_orders)} pending orders to process from CSV")
+    return pending_orders
+
+
+def get_canceled_orders_from_magento(config: dict, csv_filename: Optional[str] = None) -> List[str]:
     """
     Step 1: Get canceled orders from Magento database.
     
     Returns list of increment_ids for canceled orders.
+    If csv_filename is provided, saves orders to CSV with initial status.
     """
     logger.info("Step 1: Fetching canceled orders from Magento...")
     
@@ -163,26 +266,45 @@ def get_canceled_orders_from_magento(config: dict) -> List[str]:
                 if increment_ids:
                     logger.debug(f"Order IDs: {increment_ids}")
                 
+                # Save to CSV if filename provided
+                if csv_filename and increment_ids:
+                    orders_data = {}
+                    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    for order_id in increment_ids:
+                        orders_data[order_id] = {
+                            'order_id': order_id,
+                            'payment_id': '',
+                            'requires_cancellation': None,
+                            'cancellation_attempted': False,
+                            'cancellation_status': 'PENDING',
+                            'error_message': '',
+                            'timestamp': current_time
+                        }
+                    save_orders_to_csv(csv_filename, orders_data)
+                    logger.info(f"Saved {len(increment_ids)} orders to CSV with initial status")
+                
                 return increment_ids
     except Exception as e:
         logger.error(f"Error fetching canceled orders from Magento: {e}")
         raise
 
 
-def get_non_canceled_payments_from_papaya(config: dict, order_ids: List[str]) -> List[int]:
+def get_non_canceled_payments_from_papaya(config: dict, order_ids: List[str], 
+                                          csv_filename: Optional[str] = None) -> Tuple[List[int], Dict[str, int]]:
     """
     Step 2: Find non-canceled payments in Papaya database.
     
-    Returns list of payment_ids that need to be canceled.
+    Returns tuple of (payment_ids list, order_id to payment_id mapping).
+    If csv_filename is provided, updates CSV with payment_id info and requires_cancellation status.
     """
     if not order_ids:
         logger.info("Step 2: No orders to process, skipping Papaya query")
-        return []
+        return [], {}
     
     logger.info(f"Step 2: Fetching non-canceled payments from Papaya for {len(order_ids)} orders...")
     
     query = """
-        SELECT pi.payment_id
+        SELECT pi.payment_id, pi.client_order_id
         FROM payment_information pi
         WHERE pi.client_order_id IN %s
           AND NOT EXISTS (
@@ -203,12 +325,36 @@ def get_non_canceled_payments_from_papaya(config: dict, order_ids: List[str]) ->
                 results = cursor.fetchall()
                 
                 payment_ids = [row['payment_id'] for row in results]
+                order_to_payment_map = {row['client_order_id']: row['payment_id'] for row in results}
+                
                 logger.info(f"Found {len(payment_ids)} non-canceled payments in Papaya")
                 
                 if payment_ids:
                     logger.debug(f"Payment IDs: {payment_ids}")
                 
-                return payment_ids
+                # Update CSV if filename provided
+                if csv_filename:
+                    orders_data = load_orders_from_csv(csv_filename)
+                    
+                    for order_id in order_ids:
+                        if order_id in orders_data:
+                            if order_id in order_to_payment_map:
+                                # Order HAS payment_id in Papaya - requires cancellation
+                                orders_data[order_id]['payment_id'] = order_to_payment_map[order_id]
+                                orders_data[order_id]['requires_cancellation'] = True
+                                orders_data[order_id]['cancellation_status'] = 'PENDING'
+                            else:
+                                # Order DOES NOT have payment_id in Papaya - no cancellation needed
+                                orders_data[order_id]['payment_id'] = ''
+                                orders_data[order_id]['requires_cancellation'] = False
+                                orders_data[order_id]['cancellation_status'] = 'NOT_REQUIRED'
+                            
+                            orders_data[order_id]['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    save_orders_to_csv(csv_filename, orders_data)
+                    logger.info(f"Updated CSV with payment information for {len(order_ids)} orders")
+                
+                return payment_ids, order_to_payment_map
     except Exception as e:
         logger.error(f"Error fetching non-canceled payments from Papaya: {e}")
         raise
@@ -249,11 +395,14 @@ def cancel_payment_via_api(config: dict, payment_id: int) -> Tuple[bool, str]:
         return False, error_msg
 
 
-def cancel_payments_via_api(config: dict, payment_ids: List[int]) -> dict:
+def cancel_payments_via_api(config: dict, payment_ids: List[int], 
+                            payment_to_order_map: Optional[Dict[int, str]] = None,
+                            csv_filename: Optional[str] = None) -> dict:
     """
     Step 3: Cancel payments via Papaya API.
     
     Returns dictionary with statistics.
+    If csv_filename is provided, updates CSV after each cancellation attempt.
     """
     if not payment_ids:
         logger.info("Step 3: No payments to cancel")
@@ -279,6 +428,16 @@ def cancel_payments_via_api(config: dict, payment_ids: List[int]) -> dict:
                 'payment_id': payment_id,
                 'error': message
             })
+        
+        # Update CSV if filename and mapping provided
+        if csv_filename and payment_to_order_map and payment_id in payment_to_order_map:
+            order_id = payment_to_order_map[payment_id]
+            updates = {
+                'cancellation_attempted': True,
+                'cancellation_status': 'SUCCESS' if success else 'FAILED',
+                'error_message': '' if success else message
+            }
+            update_order_in_csv(csv_filename, order_id, updates)
     
     logger.info(f"Cancellation complete: {stats['success']} succeeded, {stats['failed']} failed")
     
@@ -298,26 +457,104 @@ def main():
         # Load configuration
         config = load_configuration()
         
-        # Step 1: Get canceled orders from Magento
-        canceled_orders = get_canceled_orders_from_magento(config)
+        # Generate CSV filename
+        csv_filename = get_csv_filename(config)
+        logger.info(f"CSV filename: {csv_filename}")
         
-        # Step 2: Find non-canceled payments in Papaya
-        non_canceled_payments = get_non_canceled_payments_from_papaya(config, canceled_orders)
+        # Check if CSV exists for resuming
+        resume_mode = os.path.exists(csv_filename)
         
-        # Step 3: Cancel payments via API
-        stats = cancel_payments_via_api(config, non_canceled_payments)
+        if resume_mode:
+            logger.info("=" * 80)
+            logger.info("RESUME MODE: CSV file found, resuming from previous run")
+            logger.info("=" * 80)
+            
+            # Load existing orders
+            orders_data = load_orders_from_csv(csv_filename)
+            
+            # Get pending orders that need processing
+            pending_order_ids = get_pending_orders_from_csv(csv_filename)
+            
+            if not pending_order_ids:
+                logger.info("No pending orders to process. All orders have been handled.")
+                
+                # Generate final statistics
+                total_orders = len(orders_data)
+                requires_cancellation = sum(1 for o in orders_data.values() if o.get('requires_cancellation') is True)
+                not_required = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'NOT_REQUIRED')
+                successful = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'SUCCESS')
+                failed = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'FAILED')
+                
+                logger.info("=" * 80)
+                logger.info("Payment Cancellation Summary (from CSV):")
+                logger.info(f"  Total orders in CSV: {total_orders}")
+                logger.info(f"  Orders requiring cancellation: {requires_cancellation}")
+                logger.info(f"  Orders not requiring cancellation: {not_required}")
+                logger.info(f"  Payments successfully canceled: {successful}")
+                logger.info(f"  Payments failed to cancel: {failed}")
+                logger.info(f"  CSV file location: {os.path.abspath(csv_filename)}")
+                logger.info("=" * 80)
+                logger.info("Script completed - all orders already processed")
+                sys.exit(0)
+            
+            logger.info(f"Resuming processing for {len(pending_order_ids)} pending orders")
+            
+            # Step 2: Find non-canceled payments in Papaya (only for pending orders)
+            non_canceled_payments, order_to_payment_map = get_non_canceled_payments_from_papaya(
+                config, pending_order_ids, csv_filename
+            )
+            
+            # Create reverse mapping (payment_id -> order_id) for CSV updates
+            payment_to_order_map = {v: k for k, v in order_to_payment_map.items()}
+            
+            # Step 3: Cancel payments via API
+            stats = cancel_payments_via_api(config, non_canceled_payments, payment_to_order_map, csv_filename)
+            
+            # Reload orders data for final statistics
+            orders_data = load_orders_from_csv(csv_filename)
+            
+        else:
+            logger.info("=" * 80)
+            logger.info("NEW RUN MODE: No CSV file found, starting fresh")
+            logger.info("=" * 80)
+            
+            # Step 1: Get canceled orders from Magento
+            canceled_orders = get_canceled_orders_from_magento(config, csv_filename)
+            
+            # Step 2: Find non-canceled payments in Papaya
+            non_canceled_payments, order_to_payment_map = get_non_canceled_payments_from_papaya(
+                config, canceled_orders, csv_filename
+            )
+            
+            # Create reverse mapping (payment_id -> order_id) for CSV updates
+            payment_to_order_map = {v: k for k, v in order_to_payment_map.items()}
+            
+            # Step 3: Cancel payments via API
+            stats = cancel_payments_via_api(config, non_canceled_payments, payment_to_order_map, csv_filename)
+            
+            # Load final data from CSV for statistics
+            orders_data = load_orders_from_csv(csv_filename)
+        
+        # Generate final statistics from CSV
+        total_orders = len(orders_data)
+        requires_cancellation = sum(1 for o in orders_data.values() if o.get('requires_cancellation') is True)
+        not_required = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'NOT_REQUIRED')
+        successful = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'SUCCESS')
+        failed = sum(1 for o in orders_data.values() if o.get('cancellation_status') == 'FAILED')
         
         # Summary
         logger.info("=" * 80)
         logger.info("Payment Cancellation Summary:")
-        logger.info(f"  Canceled orders found in Magento: {len(canceled_orders)}")
-        logger.info(f"  Non-canceled payments found in Papaya: {len(non_canceled_payments)}")
-        logger.info(f"  Payments successfully canceled: {stats['success']}")
-        logger.info(f"  Payments failed to cancel: {stats['failed']}")
+        logger.info(f"  Total orders in CSV: {total_orders}")
+        logger.info(f"  Orders requiring cancellation: {requires_cancellation}")
+        logger.info(f"  Orders not requiring cancellation: {not_required}")
+        logger.info(f"  Payments successfully canceled: {successful}")
+        logger.info(f"  Payments failed to cancel: {failed}")
+        logger.info(f"  CSV file location: {os.path.abspath(csv_filename)}")
         logger.info("=" * 80)
         
-        if stats['failed'] > 0:
-            logger.warning("Some payments failed to cancel. Check the log for details.")
+        if failed > 0:
+            logger.warning("Some payments failed to cancel. Check the log and CSV file for details.")
             sys.exit(1)
         else:
             logger.info("Script completed successfully")
